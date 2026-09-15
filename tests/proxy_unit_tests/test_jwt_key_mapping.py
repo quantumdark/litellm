@@ -92,6 +92,69 @@ async def test_jwt_to_virtual_key_mapping_resolution():
 
 
 @pytest.mark.asyncio
+async def test_colliding_claim_value_from_another_issuer_does_not_resolve_to_the_wrong_virtual_key():
+    """LIT-7417: a mapping registered for one issuer must not answer a lookup from a
+    DIFFERENT issuer whose claim value happens to collide, even though both issuers
+    map the same claim field (``sub``) to a virtual key."""
+    issuer_a = "https://issuer-a.example.com"
+    issuer_b = "https://issuer-b.example.com"
+
+    jwt_handler = JWTHandler()
+    jwt_handler.litellm_jwtauth = LiteLLM_JWTAuth(
+        virtual_key_claim_field="sub", virtual_key_mapping_cache_ttl=3600
+    )
+
+    rows = [
+        {
+            "jwt_issuer": issuer_b,
+            "jwt_claim_name": "sub",
+            "jwt_claim_value": "dev-alice",
+            "token": "hashed-issuer-b-key",
+            "is_active": True,
+        }
+    ]
+
+    async def fake_find_first(where):
+        for row in rows:
+            if all(row.get(k) == v for k, v in where.items()):
+                return MagicMock(**row)
+        return None
+
+    prisma_client = MagicMock()
+    prisma_client.db.litellm_jwtkeymapping.find_first = AsyncMock(side_effect=fake_find_first)
+
+    mock_key_obj = UserAPIKeyAuth(token="hashed-issuer-b-key", team_id="issuer-b-team")
+    with patch(
+        "litellm.proxy.auth.resolvers.store.IdentityStore._resolve_key",
+        new_callable=AsyncMock,
+        return_value=mock_key_obj,
+    ):
+        # The rightful owner: issuer-b's own claim resolves to its mapping.
+        owner_result = await _resolve_jwt_to_virtual_key(
+            jwt_claims={JWTHandler.LITELLM_JWT_ISSUER_CLAIM: issuer_b, "sub": "dev-alice"},
+            jwt_handler=jwt_handler,
+            prisma_client=prisma_client,
+            user_api_key_cache=DualCache(),
+            parent_otel_span=None,
+            proxy_logging_obj=None,
+        )
+        assert owner_result == mock_key_obj
+
+        # A validly-signed token from issuer-a carrying the SAME claim value must not
+        # inherit issuer-b's mapping. Default behavior is fallback_team_mapping, so a
+        # correctly-scoped miss returns None instead of resolving to issuer-b's key.
+        colliding_result = await _resolve_jwt_to_virtual_key(
+            jwt_claims={JWTHandler.LITELLM_JWT_ISSUER_CLAIM: issuer_a, "sub": "dev-alice"},
+            jwt_handler=jwt_handler,
+            prisma_client=prisma_client,
+            user_api_key_cache=DualCache(),
+            parent_otel_span=None,
+            proxy_logging_obj=None,
+        )
+        assert colliding_result is None
+
+
+@pytest.mark.asyncio
 async def test_jwt_to_virtual_key_mapping_no_mapping():
     """
     Test that when no mapping exists, resolve returns None.
@@ -223,6 +286,7 @@ def test_to_response_excludes_token():
     now = datetime.now(timezone.utc)
     mock_mapping = MagicMock()
     mock_mapping.id = "mapping-1"
+    mock_mapping.jwt_issuer = None
     mock_mapping.jwt_claim_name = "email"
     mock_mapping.jwt_claim_value = "user@example.com"
     mock_mapping.token = "hashed_secret_value"
@@ -275,10 +339,12 @@ def _mock_mapping(
     id="mapping-1",
     claim_name="email",
     claim_value="user@example.com",
+    issuer=None,
 ):
     now = datetime.now(timezone.utc)
     m = MagicMock()
     m.id = id
+    m.jwt_issuer = issuer
     m.jwt_claim_name = claim_name
     m.jwt_claim_value = claim_value
     m.token = "hashed_token"

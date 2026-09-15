@@ -837,6 +837,7 @@ class _PendingAutoRegister(NamedTuple):
     claim_field: str
     claim_value: str
     cache_key: str
+    jwt_issuer: str | None = None
 
 
 async def _auto_register_jwt_mapping(
@@ -848,6 +849,7 @@ async def _auto_register_jwt_mapping(
     parent_otel_span: Span | None,
     proxy_logging_obj: ProxyLogging,
     cache_key: str,
+    jwt_issuer: str | None = None,
     team_id: str | None = None,
     user_id: str | None = None,
     org_id: str | None = None,
@@ -898,6 +900,7 @@ async def _auto_register_jwt_mapping(
     try:
         await prisma_client.db.litellm_jwtkeymapping.create(
             data={
+                "jwt_issuer": jwt_issuer,
                 "jwt_claim_name": virtual_key_claim_field,
                 "jwt_claim_value": claim_value,
                 "token": token_hash,
@@ -932,6 +935,7 @@ async def _auto_register_jwt_mapping(
                 jwt_claim_name=virtual_key_claim_field,
                 jwt_claim_value=claim_value,
                 prisma_client=prisma_client,
+                jwt_issuer=jwt_issuer,
             )
             if token_hash is None:
                 # The winner's mapping vanished between the unique-constraint
@@ -1034,7 +1038,7 @@ async def _resolve_jwt_to_virtual_key(
             )
         return None
 
-    cache_key: Final = jwt_key_mapping_cache_key(virtual_key_claim_field, str(claim_value))
+    cache_key: Final = jwt_key_mapping_cache_key(virtual_key_claim_field, str(claim_value), normalized_issuer)
     raw_cached_mapping: Final = await user_api_key_cache.async_get_cache(cache_key)
     sentinel_written_by_this_policy: Final = behavior == UnregisteredJWTClientBehavior.AUTO_REGISTER
     cached_mapping: Final = (
@@ -1074,6 +1078,7 @@ async def _resolve_jwt_to_virtual_key(
                 claim_field=virtual_key_claim_field,
                 claim_value=str(claim_value),
                 cache_key=cache_key,
+                jwt_issuer=normalized_issuer,
             )
         return None
     elif cached_mapping is not None:
@@ -1094,6 +1099,7 @@ async def _resolve_jwt_to_virtual_key(
             jwt_claim_name=virtual_key_claim_field,
             jwt_claim_value=str(claim_value),
             prisma_client=prisma_client,
+            jwt_issuer=normalized_issuer,
         )
 
     if token_hash is not None:
@@ -1142,6 +1148,7 @@ async def _resolve_jwt_to_virtual_key(
             claim_field=virtual_key_claim_field,
             claim_value=str(claim_value),
             cache_key=cache_key,
+            jwt_issuer=normalized_issuer,
         )
 
     # FALLBACK_TEAM_MAPPING (default): cache the miss and return None so the
@@ -1631,6 +1638,7 @@ async def _user_api_key_auth_builder(
                             parent_otel_span=parent_otel_span,
                             proxy_logging_obj=proxy_logging_obj,
                             cache_key=pending_auto_register.cache_key,
+                            jwt_issuer=pending_auto_register.jwt_issuer,
                             team_id=team_id,
                             user_id=user_id,
                             org_id=org_id,

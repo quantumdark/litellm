@@ -148,6 +148,7 @@ class _PrismaDictableRow(Protocol):
 
 class _PrismaJWTKeyMappingRow(Protocol):
     token: str
+    jwt_issuer: str | None
     jwt_claim_name: str
     jwt_claim_value: str
 
@@ -3601,9 +3602,17 @@ async def _fetch_key_object_from_db_with_reconnect(
             raise
 
 
-def jwt_key_mapping_cache_key(jwt_claim_name: str, jwt_claim_value: str) -> str:
-    """Cache key under which ``_resolve_jwt_to_virtual_key`` stores a JWT-claim-to-key mapping."""
-    return f"jwt_key_mapping:{jwt_claim_name}:{jwt_claim_value}"
+def jwt_key_mapping_cache_key(jwt_claim_name: str, jwt_claim_value: str, jwt_issuer: str | None = None) -> str:
+    """Cache key under which ``_resolve_jwt_to_virtual_key`` stores a JWT-claim-to-key mapping.
+
+    Scoped by issuer (when one is configured) so a cached hit or ``__NO_MAPPING__`` miss
+    for one issuer's claim value can never be served to a different issuer whose claim
+    value happens to collide. Unchanged when there's no issuer, keeping the single-issuer
+    (no ``litellm_jwtauth.issuers`` configured) cache key format stable across this fix.
+    """
+    if jwt_issuer is None:
+        return f"jwt_key_mapping:{jwt_claim_name}:{jwt_claim_value}"
+    return f"jwt_key_mapping:{jwt_issuer}:{jwt_claim_name}:{jwt_claim_value}"
 
 
 @log_db_metrics
@@ -3615,7 +3624,9 @@ async def get_jwt_key_mapping_cache_keys_for_token(
     mappings: Final = await _jwt_key_mapping_table(JWTKeyMappingRepository(prisma_client)).find_many(
         where={"token": hashed_token}
     )
-    return tuple(jwt_key_mapping_cache_key(m.jwt_claim_name, m.jwt_claim_value) for m in mappings)
+    return tuple(
+        jwt_key_mapping_cache_key(m.jwt_claim_name, m.jwt_claim_value, m.jwt_issuer) for m in mappings
+    )
 
 
 @log_db_metrics
@@ -3623,21 +3634,41 @@ async def get_jwt_key_mapping_object(
     jwt_claim_name: str,
     jwt_claim_value: str,
     prisma_client: PrismaClient,
+    jwt_issuer: str | None = None,
 ) -> str | None:
     """
-    Lookup a JWT-to-virtual-key mapping from the database.
+    Lookup a JWT-to-virtual-key mapping from the database, scoped to the token's issuer.
+
+    An issuer-scoped mapping wins when one exists; otherwise falls back to an
+    issuer-agnostic mapping (``jwt_issuer`` is NULL), which keeps mappings created
+    before issuer scoping existed working for every issuer.
 
     Returns the hashed token (str) if a matching active mapping is found, else None.
     """
-    mapping: Final = await _jwt_key_mapping_table(JWTKeyMappingRepository(prisma_client)).find_first(
+    table: Final = _jwt_key_mapping_table(JWTKeyMappingRepository(prisma_client))
+
+    if jwt_issuer is not None:
+        issuer_scoped: Final = await table.find_first(
+            where={
+                "jwt_claim_name": jwt_claim_name,
+                "jwt_claim_value": jwt_claim_value,
+                "jwt_issuer": jwt_issuer,
+                "is_active": True,
+            }
+        )
+        if issuer_scoped is not None:
+            return issuer_scoped.token
+
+    global_mapping: Final = await table.find_first(
         where={
             "jwt_claim_name": jwt_claim_name,
             "jwt_claim_value": jwt_claim_value,
+            "jwt_issuer": None,
             "is_active": True,
         }
     )
-    if mapping is not None:
-        return mapping.token
+    if global_mapping is not None:
+        return global_mapping.token
     return None
 
 
